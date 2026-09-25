@@ -37,7 +37,7 @@ A first-party-styled OpenVPN **and Proton VPN** widget for the [Omarchy](https:/
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/CHANGE-ME/omarchy-vpn-proton-plugin.git --enable
+omarchy plugin add https://github.com/BetoFandino/omarchy-vpn-proton-plugin.git --enable
 ```
 
 This clones the plugin into `~/.config/omarchy/plugins/jfandi.vpn/`, enables it, and adds its icon to the bar.
@@ -51,7 +51,7 @@ omarchy restart shell
 ### Manual install
 
 ```bash
-git clone https://github.com/CHANGE-ME/omarchy-vpn-proton-plugin.git ~/.config/omarchy/plugins/jfandi.vpn
+git clone https://github.com/BetoFandino/omarchy-vpn-proton-plugin.git ~/.config/omarchy/plugins/jfandi.vpn
 omarchy plugin enable jfandi.vpn
 omarchy restart shell
 ```
