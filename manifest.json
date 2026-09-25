@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "jfandi.vpn",
+  "name": "VPN + Proton",
+  "version": "2.0.0",
+  "author": "jfandi (fork of srlinux/omarchy-vpn-plugin by Leandro Barbosa)",
+  "license": "MIT",
+  "homepage": "https://github.com/CHANGE-ME/omarchy-vpn-proton-plugin",
+  "repository": "https://github.com/CHANGE-ME/omarchy-vpn-proton-plugin",
+  "description": "Import .ovpn profiles and connect/disconnect OpenVPN via NetworkManager, plus one-click Proton VPN through the official protonvpn CLI.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "VPN",
+    "description": "Connect/disconnect OpenVPN profiles and Proton VPN",
+    "category": "Network",
+    "aliases": [
+      "openvpn",
+      "ovpn",
+      "proton",
+      "protonvpn"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

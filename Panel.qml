@@ -1,0 +1,1436 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Quickshell
+import Quickshell.Io
+import qs.Ui
+import qs.Commons
+import "Model.js" as Model
+
+// VPN plugin popup. Imports .ovpn profiles via NetworkManager's own OpenVPN
+// plugin (nmcli connection import type openvpn) and drives connect/disconnect
+// through nmcli. It also drives Proton VPN through the official `protonvpn`
+// CLI (connect / disconnect / status) from a dedicated row at the top of the
+// list. The rest works like the built-in Network panel does for Wi-Fi via
+// Quickshell.Networking. Chrome (Panel/KeyboardPanel/Button/TextField/
+// ToggleSwitch/CursorSurface/PanelSeparator/PanelSectionHeader/
+// PanelActionButton) is all native Omarchy UI so this reads like a first-
+// party widget rather than a bolted-on tool.
+Panel {
+  id: root
+  moduleName: "jfandi.vpn"
+  ipcTarget: "jfandi.vpn"
+  manageIpc: false
+
+  readonly property color fg: bar ? bar.foreground : Color.foreground
+  readonly property color dim: Qt.darker(fg, 1.5)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
+  readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
+
+  // ---- connection list ------------------------------------------------
+  property var vpns: []
+  // anyActive: an imported OpenVPN profile is up. anyConnected also counts
+  // Proton VPN.
+  readonly property bool anyActive: {
+    for (var i = 0; i < vpns.length; i++) if (vpns[i].active) return true
+    return false
+  }
+  readonly property bool anyConnected: anyActive || proton.connected
+
+  // ---- Proton VPN (official CLI) ----------------------------------------
+  property bool protonAvailable: true   // false once we learn `protonvpn` isn't installed
+  property var proton: ({ connected: false, server: "", location: "", load: "", protocol: "", needsSignin: false })
+  property string protonBusy: ""        // "" | "connect" | "disconnect"
+  property string protonError: ""
+  property var protonStats: ({})
+
+  // Optional country for quick-connect ("US", "Germany", ...), persisted in
+  // this widget's bar entry (shell.json) as "protonCountry". Empty = fastest.
+  readonly property string protonCountry: String(setting("protonCountry", "") || "")
+
+  // ---- per-row transient state -----------------------------------------
+  property string busyUuid: ""
+  property string busyKind: ""   // "connect" | "disconnect" | "remove"
+  property string errorUuid: ""
+  property string errorText: ""
+  property string credentialsUuid: ""
+  property string usernameText: ""
+  property string passwordText: ""
+  property bool credentialsIsRetry: false
+  property bool rememberPassword: true
+  property string pendingUsername: ""
+
+  // ---- import flow --------------------------------------------------
+  property bool importing: false
+  property string importError: ""
+
+  // "Split tunnel on import": persisted in this widget's bar entry
+  // (shell.json) so it survives shell restarts. On by default.
+  readonly property bool splitTunnelOnImport: setting("splitTunnelOnImport", true) !== false
+
+  function setSplitTunnelOnImport(value) {
+    if (!root.bar || !root.bar.shell || typeof root.bar.shell.updateEntryInline !== "function") return
+    var entry = { id: root.moduleName }
+    for (var key in settings) if (key !== "id") entry[key] = settings[key]
+    entry.splitTunnelOnImport = !!value
+    root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+  property string flashText: ""
+
+  // ---- live per-connection stats (IP, gateway, rx/tx rates) ------------
+  // Keyed by uuid so several VPNs open at once (or the row list reordering)
+  // never mixes up counters. Refreshed on the same cadence as the built-in
+  // Network panel's detailsPoll.
+  property var vpnStats: ({})
+
+  function close() {
+    root.controller.hide()
+    importOptionsOpen = false
+    cancelCredentials()
+  }
+
+  function cancelCredentials() {
+    credentialsUuid = ""
+    usernameText = ""
+    passwordText = ""
+    credentialsIsRetry = false
+  }
+
+  function showFlash(msg) {
+    flashText = msg
+    flashTimer.restart()
+  }
+
+  function refresh() {
+    if (!listProc.running) listProc.running = true
+    refreshProton()
+  }
+
+  function refreshProton() {
+    if (!protonAvailable || protonBusy !== "" || protonStatusProc.running) return
+    protonStatusProc.command = ["/usr/bin/bash", "-c", Model.protonScript, "proton-status", "status"]
+    protonStatusProc.running = true
+  }
+
+  function refreshProtonStats() {
+    if (!proton.connected) {
+      if (Object.keys(protonStats).length > 0) protonStats = {}
+      return
+    }
+    if (protonStatsProc.running) return
+    protonStatsProc.command = ["/usr/bin/bash", "-c", Model.protonStatsScript, "proton-stats"]
+    protonStatsProc.running = true
+  }
+
+  function toggleProton() {
+    if (protonBusy !== "") return
+    protonError = ""
+    if (proton.connected) {
+      protonBusy = "disconnect"
+      protonActionProc.command = ["/usr/bin/bash", "-c", Model.protonScript, "proton-disconnect", "disconnect"]
+    } else {
+      protonBusy = "connect"
+      protonActionProc.command = ["/usr/bin/bash", "-c", Model.protonScript, "proton-connect"]
+        .concat(Model.protonConnectArgs(protonCountry))
+    }
+    protonActionProc.running = true
+  }
+
+  function refreshStats() {
+    var uuids = []
+    for (var i = 0; i < vpns.length; i++) if (vpns[i].active) uuids.push(vpns[i].uuid)
+    if (uuids.length === 0) {
+      if (Object.keys(vpnStats).length > 0) vpnStats = {}
+      return
+    }
+    if (statsProc.running) return
+    statsProc.command = ["/usr/bin/bash", "-c", Model.statsScript, "vpn-stats"].concat(uuids)
+    statsProc.running = true
+  }
+
+  // Clicking "Import .ovpn" first opens the import options (split tunnel);
+  // "Choose file" there starts the actual file picker.
+  property bool importOptionsOpen: false
+
+  function startImport() {
+    if (pickFileProc.running || importing) return
+    importOptionsOpen = false
+    importError = ""
+    pickFileProc.running = true
+  }
+
+  function importFile(path) {
+    if (path === "") return
+    importing = true
+    importError = ""
+    importProc.command = ["/usr/bin/nmcli", "connection", "import", "type", "openvpn", "file", path]
+    importProc.running = true
+  }
+
+  // Toggle a row: connected -> disconnect, otherwise -> probe then connect.
+  function toggle(vpn) {
+    if (busyUuid !== "" || !vpn) return
+    if (vpn.active) { disconnectVpn(vpn); return }
+    errorUuid = ""
+    errorText = ""
+    busyUuid = vpn.uuid
+    busyKind = "probe"
+    probeProc.targetUuid = vpn.uuid
+    probeProc.command = ["/usr/bin/bash", "-c", Model.probeScript, "vpn-probe", vpn.uuid]
+    probeProc.running = true
+  }
+
+  function afterProbe(uuid, vpnData, userName) {
+    busyUuid = ""
+    busyKind = ""
+    if (Model.needsCredentials(vpnData)) {
+      pendingUsername = userName
+      busyUuid = uuid
+      busyKind = "probe"
+      secretLookupProc.targetUuid = uuid
+      secretLookupProc.command = ["/usr/bin/bash", "-c", Model.secretLookupScript, "vpn-secret-lookup", uuid]
+      secretLookupProc.running = true
+    } else {
+      connectDirect(uuid)
+    }
+  }
+
+  function vpnName(uuid) {
+    for (var i = 0; i < vpns.length; i++) if (vpns[i].uuid === uuid) return vpns[i].name
+    return "VPN"
+  }
+
+  // A stored password came back from the keyring for this uuid: connect
+  // with it straight away, no prompt. If it turns out to be stale (profile
+  // password changed on the server side) credConnectProc's failure handler
+  // clears it and falls back to the manual prompt.
+  function connectWithSavedSecret(uuid, user, secret) {
+    busyUuid = uuid
+    busyKind = "connect"
+    credConnectProc.targetUuid = uuid
+    credConnectProc.targetUser = user
+    credConnectProc.secret = secret
+    credConnectProc.secretForStore = ""
+    credConnectProc.fromKeyring = true
+    credConnectProc.command = ["/usr/bin/bash", "-c", Model.credentialConnectScript, "vpn-connect", uuid, user]
+    credConnectProc.running = true
+  }
+
+  function openManualCredentialPrompt(uuid, user, retry) {
+    busyUuid = ""
+    busyKind = ""
+    credentialsUuid = uuid
+    usernameText = user
+    passwordText = ""
+    credentialsIsRetry = !!retry
+  }
+
+  function connectDirect(uuid) {
+    busyUuid = uuid
+    busyKind = "connect"
+    connectProc.targetUuid = uuid
+    connectProc.command = ["/usr/bin/nmcli", "connection", "up", uuid]
+    connectProc.running = true
+  }
+
+  function submitCredentials() {
+    if (credentialsUuid === "" || passwordText.length === 0 || busyUuid !== "") return
+    var uuid = credentialsUuid
+    var user = usernameText
+    busyUuid = uuid
+    busyKind = "connect"
+    credConnectProc.targetUuid = uuid
+    credConnectProc.targetUser = user
+    credConnectProc.secret = passwordText
+    credConnectProc.secretForStore = passwordText
+    credConnectProc.fromKeyring = false
+    credConnectProc.command = ["/usr/bin/bash", "-c", Model.credentialConnectScript, "vpn-connect", uuid, user]
+    credConnectProc.running = true
+  }
+
+  function disconnectVpn(vpn) {
+    if (busyUuid !== "" || !vpn) return
+    busyUuid = vpn.uuid
+    busyKind = "disconnect"
+    disconnectProc.targetUuid = vpn.uuid
+    disconnectProc.command = ["/usr/bin/nmcli", "connection", "down", vpn.uuid]
+    disconnectProc.running = true
+  }
+
+  function removeVpn(vpn) {
+    if (busyUuid !== "" || !vpn) return
+    busyUuid = vpn.uuid
+    busyKind = "remove"
+    removeProc.targetUuid = vpn.uuid
+    removeProc.command = ["/usr/bin/nmcli", "connection", "delete", vpn.uuid]
+    removeProc.running = true
+    secretClearProc.command = ["/usr/bin/bash", "-c", Model.secretClearScript, "vpn-secret-clear", vpn.uuid]
+    secretClearProc.running = true
+  }
+
+  onOpenedChanged: if (opened) { refresh(); refreshStats(); refreshProtonStats() }
+
+  Timer {
+    id: refreshTimer
+    interval: 4000
+    repeat: true
+    running: root.opened
+    triggeredOnStart: true
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    id: statsTimer
+    interval: 1500
+    repeat: true
+    running: root.opened && root.anyActive
+    triggeredOnStart: true
+    onTriggered: root.refreshStats()
+  }
+
+  Timer {
+    id: protonStatsTimer
+    interval: 1500
+    repeat: true
+    running: root.opened && root.proton.connected
+    triggeredOnStart: true
+    onTriggered: root.refreshProtonStats()
+  }
+
+  Timer {
+    id: flashTimer
+    interval: 2600
+    repeat: false
+    onTriggered: root.flashText = ""
+  }
+
+  IpcHandler {
+    target: "jfandi.vpn"
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): string { root.refresh(); return "ok" }
+  }
+
+  // ---- processes --------------------------------------------------------
+  //
+  // Every Process below sets clearEnvironment: true and a fixed, minimal
+  // environment (root.safeEnv) instead of inheriting the shell's ambient
+  // $PATH. Combined with the absolute tool paths baked into Model.js's
+  // scripts, this means nothing here resolves an external command by name
+  // through a spoofable search path — relevant everywhere, but especially
+  // on credConnectProc, which is the one process a VPN password ever
+  // passes through.
+  readonly property var safeEnv: ({ "PATH": "/usr/bin", "HOME": Quickshell.env("HOME") || "/root" })
+
+  // Processes that talk to the session D-Bus — secret-tool (gnome-keyring)
+  // and omarchy-file-select (the desktop file-chooser portal) — also need
+  // the bus address. Without it they try to autolaunch D-Bus via X11 and
+  // fail immediately.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property var sessionEnv: ({
+    "PATH": "/usr/bin",
+    "HOME": Quickshell.env("HOME") || "/root",
+    "XDG_RUNTIME_DIR": runtimeDir,
+    "DBUS_SESSION_BUS_ADDRESS": Quickshell.env("DBUS_SESSION_BUS_ADDRESS") || ("unix:path=" + runtimeDir + "/bus")
+  })
+
+  Process {
+    id: listProc
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: ["/usr/bin/nmcli", "-t", "-e", "no", "-f", "NAME,UUID,TYPE,ACTIVE", "connection", "show"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.vpns = Model.parseVpnList(text)
+    }
+  }
+
+  // `protonvpn status`. Needs the session bus (the CLI talks to
+  // NetworkManager and the keyring), so it gets sessionEnv. Exit 127 means
+  // the CLI isn't installed: hide the Proton row for good.
+  Process {
+    id: protonStatusProc
+    clearEnvironment: true
+    environment: root.sessionEnv
+    command: []
+    stdout: StdioCollector { id: protonStatusStdout; waitForEnd: true }
+    stderr: StdioCollector { id: protonStatusStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 127) { root.protonAvailable = false; return }
+      if (root.protonBusy !== "") return
+      var info = Model.parseProtonStatus(protonStatusStdout.text, protonStatusStderr.text)
+      root.proton = info
+      if (info.needsSignin) root.protonError = "Not signed in \u2013 run: protonvpn signin"
+      else if (root.protonError.indexOf("Not signed in") === 0) root.protonError = ""
+      if (info.connected) root.refreshProtonStats()
+      else root.protonStats = {}
+    }
+  }
+
+  // `protonvpn connect [--country X]` / `protonvpn disconnect`.
+  Process {
+    id: protonActionProc
+    clearEnvironment: true
+    environment: root.sessionEnv
+    command: []
+    stdout: StdioCollector { id: protonActionStdout; waitForEnd: true }
+    stderr: StdioCollector { id: protonActionStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var kind = root.protonBusy
+      root.protonBusy = ""
+      if (exitCode !== 0) {
+        root.protonError = exitCode === 127
+          ? "protonvpn CLI not found"
+          : Model.protonFailureMessage(protonActionStdout.text, protonActionStderr.text)
+      } else {
+        root.protonError = ""
+        if (kind === "disconnect") root.protonStats = {}
+      }
+      root.refreshProton()
+    }
+  }
+
+  Process {
+    id: protonStatsProc
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var sample = Model.parseVpnStatsBlocks(text)
+        root.protonStats = Model.updateVpnStats(root.protonStats, sample, Date.now() / 1000)
+      }
+    }
+  }
+
+  Process {
+    id: statsProc
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector {
+      id: statsStdout
+      waitForEnd: true
+      onStreamFinished: {
+        var sample = Model.parseVpnStatsBlocks(text)
+        root.vpnStats = Model.updateVpnStats(root.vpnStats, sample, Date.now() / 1000)
+      }
+    }
+  }
+
+  Process {
+    id: pickFileProc
+    clearEnvironment: true
+    environment: root.sessionEnv
+    command: ["/usr/bin/omarchy-file-select", "--title", "Import VPN profile (.ovpn)", "--extensions", "ovpn"]
+    stdout: StdioCollector {
+      id: pickFileStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector { id: pickFileStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.importFile(Model.pickFilePath(pickFileStdout.text))
+      else if (exitCode !== 1) root.importError = "Could not open the file chooser: "
+        + Model.elideStatus(pickFileStderr.text || ("exit " + exitCode))
+    }
+  }
+
+  Process {
+    id: importProc
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector { id: importStdout; waitForEnd: true }
+    stderr: StdioCollector { id: importStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.importing = false
+      var result = Model.parseImportResult(importStdout.text, importStderr.text)
+      if (result.ok) {
+        if (root.splitTunnelOnImport) {
+          splitTunnelProc.targetName = result.name
+          splitTunnelProc.command = ["/usr/bin/bash", "-c", Model.splitTunnelScript, "vpn-split-tunnel", result.uuid]
+          splitTunnelProc.running = true
+        } else {
+          root.showFlash("Imported \u201c" + result.name + "\u201d")
+        }
+        root.refresh()
+      } else {
+        root.importError = result.error
+      }
+    }
+  }
+
+  Process {
+    id: splitTunnelProc
+    property string targetName: ""
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stderr: StdioCollector { id: splitTunnelStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.showFlash("Imported \u201c" + splitTunnelProc.targetName + "\u201d (split tunnel)")
+      } else {
+        root.importError = "Imported \u201c" + splitTunnelProc.targetName + "\u201d, but split tunnel failed: "
+          + Model.elideStatus(splitTunnelStderr.text || "nmcli error")
+      }
+    }
+  }
+
+  Process {
+    id: probeProc
+    property string targetUuid: ""
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector { id: probeStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var parts = String(probeStdout.text || "").split("@@OMARCHY-VPN@@")
+      var vpnData = Model.parseVpnData(parts[0] || "")
+      var userName = (parts[1] || "").trim()
+      root.afterProbe(probeProc.targetUuid, vpnData, userName)
+    }
+  }
+
+  // Looks up a previously-saved password for this uuid before falling back
+  // to the manual prompt. A miss (unknown uuid / secret-tool absent / user
+  // never saved one) is a normal, silent outcome — not an error — so the
+  // exit path always resumes the connect flow one way or the other.
+  Process {
+    id: secretLookupProc
+    property string targetUuid: ""
+    clearEnvironment: true
+    environment: root.sessionEnv
+    command: []
+    stdout: StdioCollector { id: secretLookupStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var uuid = secretLookupProc.targetUuid
+      var user = root.pendingUsername
+      if (exitCode === 0) {
+        var secret = String(secretLookupStdout.text || "").replace(/\n$/, "")
+        if (secret.length > 0) {
+          root.connectWithSavedSecret(uuid, user, secret)
+          return
+        }
+      }
+      root.openManualCredentialPrompt(uuid, user, false)
+    }
+  }
+
+  // Saves a password to the keyring after a manual credential submit
+  // succeeds. Fire-and-forget: a failure here (keyring locked, secret-tool
+  // missing) only means the next connect asks again, it never blocks or
+  // reverses the VPN connection that already succeeded.
+  Process {
+    id: secretStoreProc
+    stdinEnabled: true
+    clearEnvironment: true
+    environment: root.sessionEnv
+    command: []
+    property string secret: ""
+    onStarted: {
+      write(secret + "\n")
+      secret = ""
+    }
+  }
+
+  // Best-effort removal of a stored secret: profile deleted, or a saved
+  // password turned out stale and credConnectProc is falling back to the
+  // manual prompt. Never surfaces an error to the user either way.
+  Process {
+    id: secretClearProc
+    clearEnvironment: true
+    environment: root.sessionEnv
+    command: []
+  }
+
+  Process {
+    id: connectProc
+    property string targetUuid: ""
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector { id: connectStdout; waitForEnd: true }
+    stderr: StdioCollector { id: connectStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.busyUuid = ""
+      root.busyKind = ""
+      if (exitCode !== 0) {
+        root.errorUuid = connectProc.targetUuid
+        root.errorText = Model.connectFailureMessage(connectStderr.text, connectStdout.text)
+      } else {
+        root.errorUuid = ""
+        root.errorText = ""
+      }
+      root.refresh()
+      root.refreshStats()
+    }
+  }
+
+  // Connects with credentials. The password travels over stdin into a
+  // mode-600 temp file created *inside* the script, then straight to
+  // nmcli's passwd-file option — it is never an argv value, so it never
+  // appears in /proc/<pid>/cmdline. Mirrors the WiFi enterprise-connect
+  // script in the built-in Network panel's Model.js. clearEnvironment plus
+  // a fixed PATH here (and the absolute paths inside
+  // Model.credentialConnectScript itself) close off PATH-hijacking as a way
+  // to intercept the secret or swap the connect operation.
+  Process {
+    id: credConnectProc
+    property string targetUuid: ""
+    property string targetUser: ""
+    property string secret: ""
+    property string secretForStore: ""
+    property bool fromKeyring: false
+    stdinEnabled: true
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector { id: credConnectStdout; waitForEnd: true }
+    stderr: StdioCollector { id: credConnectStderr; waitForEnd: true }
+    onStarted: {
+      write(secret + "\n")
+      secret = ""
+    }
+    onExited: function(exitCode) {
+      root.busyUuid = ""
+      root.busyKind = ""
+      if (exitCode !== 0) {
+        root.errorUuid = credConnectProc.targetUuid
+        root.errorText = Model.connectFailureMessage(credConnectStderr.text, credConnectStdout.text)
+        if (credConnectProc.fromKeyring) {
+          // The saved password no longer works (changed on the server
+          // side, or the entry was corrupt) — drop it and fall back to
+          // asking, instead of silently retrying it forever.
+          secretClearProc.command = ["/usr/bin/bash", "-c", Model.secretClearScript, "vpn-secret-clear", credConnectProc.targetUuid]
+          secretClearProc.running = true
+          root.openManualCredentialPrompt(credConnectProc.targetUuid, credConnectProc.targetUser, true)
+        } else if (Model.connectFailureNeedsCredentials(credConnectStderr.text)) {
+          // Wrong credentials: reopen the prompt so the user can retry
+          // without re-picking the row.
+          root.credentialsUuid = credConnectProc.targetUuid
+          root.credentialsIsRetry = true
+        }
+      } else {
+        root.errorUuid = ""
+        root.errorText = ""
+        if (credConnectProc.secretForStore.length > 0 && root.rememberPassword) {
+          secretStoreProc.secret = credConnectProc.secretForStore
+          secretStoreProc.command = ["/usr/bin/bash", "-c", Model.secretStoreScript, "vpn-secret-store",
+            credConnectProc.targetUuid, root.vpnName(credConnectProc.targetUuid)]
+          secretStoreProc.running = true
+        }
+        credConnectProc.secretForStore = ""
+        root.cancelCredentials()
+      }
+      root.refresh()
+      root.refreshStats()
+    }
+  }
+
+  Process {
+    id: disconnectProc
+    property string targetUuid: ""
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector { id: disconnectStdout; waitForEnd: true }
+    stderr: StdioCollector { id: disconnectStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.busyUuid = ""
+      root.busyKind = ""
+      if (exitCode !== 0) {
+        root.errorUuid = disconnectProc.targetUuid
+        root.errorText = Model.elideStatus(disconnectStderr.text || disconnectStdout.text || "Failed to disconnect")
+      } else {
+        var next = {}
+        for (var uuid in root.vpnStats) if (uuid !== disconnectProc.targetUuid) next[uuid] = root.vpnStats[uuid]
+        root.vpnStats = next
+      }
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: removeProc
+    property string targetUuid: ""
+    clearEnvironment: true
+    environment: root.safeEnv
+    command: []
+    stdout: StdioCollector { id: removeStdout; waitForEnd: true }
+    stderr: StdioCollector { id: removeStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.busyUuid = ""
+      root.busyKind = ""
+      if (exitCode !== 0) {
+        root.errorUuid = removeProc.targetUuid
+        root.errorText = Model.elideStatus(removeStderr.text || removeStdout.text || "Failed to remove")
+      } else {
+        var next = {}
+        for (var uuid in root.vpnStats) if (uuid !== removeProc.targetUuid) next[uuid] = root.vpnStats[uuid]
+        root.vpnStats = next
+      }
+      root.refresh()
+    }
+  }
+
+  // ---- bar icon -----------------------------------------------------
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: "󰖂"
+
+    onPressed: function(b) {
+      if (root.opened) root.close()
+      else root.open()
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: root.credentialsUuid !== ""
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
+
+      Column {
+        id: column
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        spacing: Style.space(12)
+
+        // ---- hero: icon + title + import button ----
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, importBtn.visible ? importBtn.implicitHeight : 0)
+
+          Text {
+            id: heroIcon
+            textFormat: Text.PlainText
+            text: "󰖂"
+            color: root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.display
+            opacity: root.anyConnected ? 1.0 : 0.55
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Button {
+            id: importBtn
+            visible: !root.anyActive
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.importing ? "Importing\u2026" : "Import .ovpn"
+            iconText: "+"
+            bordered: true
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(5)
+            enabled: !root.importing && !pickFileProc.running
+            onClicked: { root.importError = ""; root.importOptionsOpen = !root.importOptionsOpen }
+          }
+
+          Column {
+            id: heroLabels
+            anchors.left: heroIcon.right
+            anchors.leftMargin: Style.space(14)
+            anchors.right: importBtn.visible ? importBtn.left : parent.right
+            anchors.rightMargin: importBtn.visible ? Style.space(12) : 0
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "VPN"
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              elide: Text.ElideRight
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: {
+                var n = root.proton.connected ? 1 : 0
+                for (var i = 0; i < root.vpns.length; i++) if (root.vpns[i].active) n++
+                if (n === 0) return "NOT CONNECTED"
+                if (n === 1) return "1 CONNECTED"
+                return n + " CONNECTED"
+              }
+              color: root.anyConnected ? root.fg : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+              elide: Text.ElideRight
+            }
+          }
+        }
+
+        // Import options, shown after clicking "Import .ovpn".
+        Row {
+          visible: importBtn.visible && root.importOptionsOpen
+          width: parent.width
+          spacing: Style.space(8)
+
+          ToggleSwitch {
+            id: splitTunnelSwitch
+            anchors.verticalCenter: parent.verticalCenter
+            checked: root.splitTunnelOnImport
+            foreground: root.fg
+            accent: Color.accent
+            onToggled: root.setSplitTunnelOnImport(!root.splitTunnelOnImport)
+
+            PanelToolTip {
+              visible: splitTunnelSwitch.containsMouse
+              text: "Only the profile's routes use the VPN; internet and DNS stay on your network"
+              fontFamily: root.fontFamily
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Split tunnel on import"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.setSplitTunnelOnImport(!root.splitTunnelOnImport)
+            }
+          }
+        }
+
+        Row {
+          visible: importBtn.visible && root.importOptionsOpen
+          spacing: Style.space(8)
+
+          Button {
+            text: "Choose file\u2026"
+            bordered: true
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(5)
+            onClicked: root.startImport()
+          }
+
+          Button {
+            text: "Cancel"
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(5)
+            onClicked: root.importOptionsOpen = false
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: root.importError !== ""
+          width: parent.width
+          text: root.importError
+          color: bar ? bar.urgent : Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: root.flashText !== ""
+          width: parent.width
+          text: root.flashText
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        PanelSeparator { foreground: root.fg }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSectionHeader {
+            text: "VPN CONNECTIONS"
+            foreground: root.fg
+            fontFamily: root.fontFamily
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.vpns.length === 0
+            width: parent.width
+            text: root.protonAvailable
+              ? "No OpenVPN profiles yet. Import an .ovpn file to add one."
+              : "No VPN profiles yet. Import an .ovpn file to add one."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            wrapMode: Text.WordWrap
+          }
+
+          ProtonRow {
+            visible: root.protonAvailable
+            width: parent.width
+          }
+
+          Column {
+            id: vpnColumn
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.vpns
+              VpnRow {
+                required property var modelData
+                width: vpnColumn.width
+                vpn: modelData
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // A single VPN profile row. Collapses to one line normally; expands
+  // inline to a username/password prompt when the profile needs
+  // credentials NetworkManager doesn't already have cached, or to a small
+  // IP/throughput grid (mirroring the built-in Network panel's connection
+  // details) once connected.
+  component VpnRow: CursorSurface {
+    id: row
+    required property var vpn
+
+    readonly property bool isBusy: root.busyUuid === (vpn ? vpn.uuid : "") && root.busyKind !== ""
+    readonly property bool isFailed: root.errorUuid === (vpn ? vpn.uuid : "") && root.errorText !== ""
+    readonly property bool isCredentialsOpen: root.credentialsUuid === (vpn ? vpn.uuid : "")
+    readonly property var stats: vpn ? root.vpnStats[vpn.uuid] : undefined
+    readonly property bool hasStats: vpn && vpn.active && !!stats
+    readonly property string statusText: {
+      if (!vpn) return ""
+      if (isCredentialsOpen) return ""
+      if (isBusy && root.busyKind === "probe") return "Checking\u2026"
+      if (isBusy && root.busyKind === "connect") return "Connecting\u2026"
+      if (isBusy && root.busyKind === "disconnect") return "Disconnecting\u2026"
+      if (isBusy && root.busyKind === "remove") return "Removing\u2026"
+      if (isFailed) return root.errorText
+      if (vpn.active) return "Connected"
+      return ""
+    }
+    readonly property color statusColor: isFailed ? (root.bar ? root.bar.urgent : Color.urgent) : (vpn && vpn.active ? root.fg : root.dim)
+
+    foreground: root.fg
+    current: vpn && vpn.active
+    fill: root.hoverFill
+    currentFill: root.selectedFill
+
+    implicitHeight: rowBody.implicitHeight
+      + (isCredentialsOpen ? credentialsPanel.implicitHeight + Style.spacing.md : 0)
+      + (hasStats ? statsGrid.implicitHeight + Style.spacing.md : 0)
+
+    Item {
+      id: rowBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      implicitHeight: Math.max(vpnIcon.implicitHeight, vpnInfo.implicitHeight, rowActions.implicitHeight) + Style.spacing.rowPaddingX
+
+      Text {
+        id: vpnIcon
+        textFormat: Text.PlainText
+        text: "󰖂"
+        color: row.statusColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      // Trailing actions: a Wi-Fi-style on/off switch to connect/disconnect,
+      // plus a small remove (x) that only shows on hover so the row reads
+      // clean at rest, same disclosure pattern as the Network panel's
+      // per-network Forget button.
+      Row {
+        id: rowActions
+        spacing: Style.space(8)
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+
+        Item {
+          id: removeAction
+          visible: !row.isBusy && (removeMouse.containsMouse || !vpn || !vpn.active)
+          width: Style.space(20)
+          implicitHeight: removeIcon.implicitHeight
+          anchors.verticalCenter: parent.verticalCenter
+
+          Text {
+            id: removeIcon
+            textFormat: Text.PlainText
+            width: parent.width
+            anchors.verticalCenter: parent.verticalCenter
+            horizontalAlignment: Text.AlignHCenter
+            text: "󰅙"
+            color: removeMouse.containsMouse ? (root.bar ? root.bar.urgent : Color.urgent) : Qt.darker(root.fg, 1.6)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+          }
+
+          MouseArea {
+            id: removeMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.removeVpn(row.vpn)
+          }
+
+          PanelToolTip {
+            visible: removeMouse.containsMouse
+            text: "Remove profile"
+            fontFamily: root.fontFamily
+          }
+        }
+
+        ToggleSwitch {
+          id: connectSwitch
+          anchors.verticalCenter: parent.verticalCenter
+          checked: vpn ? vpn.active : false
+          busy: row.isBusy
+          foreground: root.fg
+          accent: Color.accent
+          onToggled: root.toggle(row.vpn)
+
+          PanelToolTip {
+            visible: connectSwitch.containsMouse
+            text: vpn && vpn.active ? "Disconnect" : "Connect"
+            fontFamily: root.fontFamily
+          }
+        }
+      }
+
+      Column {
+        id: vpnInfo
+        spacing: Style.space(1)
+        anchors.left: vpnIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: rowActions.left
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+
+        Text {
+          textFormat: Text.PlainText
+          text: row.vpn ? row.vpn.name : ""
+          color: root.fg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+          width: parent.width
+        }
+        Text {
+          textFormat: Text.PlainText
+          text: row.statusText
+          visible: row.statusText !== ""
+          height: visible ? implicitHeight : 0
+          color: row.statusColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          width: parent.width
+        }
+      }
+    }
+
+    // IP / throughput details, mirroring the built-in Network panel's
+    // connection grid. Only mounted while this profile is active and a
+    // stats sample has arrived, so a fresh connect doesn't show a
+    // half-populated grid for one tick.
+    GridLayout {
+      id: statsGrid
+      visible: row.hasStats
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: rowBody.bottom
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      anchors.topMargin: Style.space(4)
+      columns: 4
+      columnSpacing: Style.space(20)
+      rowSpacing: Style.spacing.labelGap
+
+      Text {
+        textFormat: Text.PlainText
+        text: "IP Address"
+        color: root.fg
+        opacity: 0.6
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignRight
+        text: row.hasStats ? (Model.formatVpnIp(row.stats.ip) || "--") : "--"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        textFormat: Text.PlainText
+        text: "Gateway"
+        color: root.fg
+        opacity: 0.6
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignRight
+        text: row.hasStats ? (row.stats.gw || "--") : "--"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: "Receiving"
+        color: root.fg
+        opacity: 0.6
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignRight
+        text: row.hasStats ? Model.formatRate(row.stats.downloadRate) : "--"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        textFormat: Text.PlainText
+        text: "Sending"
+        color: root.fg
+        opacity: 0.6
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignRight
+        text: row.hasStats ? Model.formatRate(row.stats.uploadRate) : "--"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: "Downloaded"
+        color: root.fg
+        opacity: 0.6
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignRight
+        text: row.hasStats ? Model.formatBytes(row.stats.rx) : "--"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        textFormat: Text.PlainText
+        text: "Uploaded"
+        color: root.fg
+        opacity: 0.6
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignRight
+        text: row.hasStats ? Model.formatBytes(row.stats.tx) : "--"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+    }
+
+    // Inline username/password prompt for profiles that require
+    // credentials. Submitting connects; Esc cancels back to the row.
+    Item {
+      id: credentialsPanel
+      visible: row.isCredentialsOpen
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: rowBody.bottom
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      anchors.topMargin: Style.space(4)
+      implicitHeight: userField.implicitHeight + Style.space(4) + pwField.implicitHeight
+        + Style.space(4) + rememberRow.implicitHeight + Style.spacing.rowGap
+      height: implicitHeight
+
+      TextField {
+        id: userField
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        placeholderText: "Username"
+        font.family: Style.font.family
+        font.pixelSize: Style.font.body
+        foreground: root.fg
+        horizontalPadding: Style.spacing.controlGap
+        verticalPadding: Style.spacing.controlPaddingY
+        text: row.isCredentialsOpen ? root.usernameText : ""
+
+        onAccepted: pwField.forceActiveFocus()
+        onTextChanged: if (row.isCredentialsOpen && text !== root.usernameText) root.usernameText = text
+        Keys.onEscapePressed: root.cancelCredentials()
+
+        onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
+        Component.onCompleted: if (visible) Qt.callLater(forceActiveFocus)
+      }
+
+      TextField {
+        id: pwField
+        anchors.left: parent.left
+        anchors.right: connectBtn.left
+        anchors.top: userField.bottom
+        anchors.topMargin: Style.space(4)
+        anchors.rightMargin: Style.space(6)
+        password: true
+        placeholderText: row.isCredentialsOpen && root.credentialsIsRetry ? "Wrong password \u2013 try again" : "Password"
+        font.family: Style.font.family
+        font.pixelSize: Style.font.body
+        foreground: root.fg
+        horizontalPadding: Style.spacing.controlGap
+        verticalPadding: Style.spacing.controlPaddingY
+        text: row.isCredentialsOpen ? root.passwordText : ""
+
+        onAccepted: root.submitCredentials()
+        onTextChanged: if (row.isCredentialsOpen && text !== root.passwordText) root.passwordText = text
+        Keys.onEscapePressed: root.cancelCredentials()
+      }
+
+      PanelActionButton {
+        id: connectBtn
+        anchors.right: parent.right
+        anchors.verticalCenter: pwField.verticalCenter
+        enabled: row.vpn && pwField.text.length > 0
+        iconText: "󰄬"
+        tooltipText: "Connect"
+        foreground: root.fg
+        fontFamily: root.fontFamily
+        onClicked: root.submitCredentials()
+      }
+
+      // "Remember password" — saves the password to the system keyring
+      // (libsecret/gnome-keyring) on a successful connect, so the next
+      // connect for this profile skips this prompt entirely.
+      Row {
+        id: rememberRow
+        anchors.left: parent.left
+        anchors.top: pwField.bottom
+        anchors.topMargin: Style.space(6)
+        spacing: Style.space(8)
+
+        ToggleSwitch {
+          id: rememberSwitch
+          anchors.verticalCenter: parent.verticalCenter
+          checked: root.rememberPassword
+          foreground: root.fg
+          accent: Color.accent
+          onToggled: root.rememberPassword = !root.rememberPassword
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Remember password"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.rememberPassword = !root.rememberPassword
+          }
+        }
+      }
+    }
+  }
+
+  // Proton VPN row. Same look as VpnRow, but driven by the `protonvpn` CLI:
+  // the switch runs `protonvpn connect` / `protonvpn disconnect`, and the
+  // details grid shows what `protonvpn status` reports plus live throughput.
+  component ProtonRow: CursorSurface {
+    id: prow
+
+    readonly property bool isBusy: root.protonBusy !== ""
+    readonly property bool isFailed: root.protonError !== ""
+    readonly property bool isConnected: root.proton.connected
+    readonly property var stats: root.protonStats["proton"]
+    readonly property bool hasDetails: isConnected
+    readonly property string statusText: {
+      if (root.protonBusy === "connect") return "Connecting\u2026"
+      if (root.protonBusy === "disconnect") return "Disconnecting\u2026"
+      if (isFailed) return root.protonError
+      if (isConnected) return root.proton.location !== "" ? "Connected \u00b7 " + root.proton.location : "Connected"
+      if (root.protonCountry !== "") return "Fastest in " + root.protonCountry
+      return "Fastest server"
+    }
+    readonly property color statusColor: isFailed ? (root.bar ? root.bar.urgent : Color.urgent) : (isConnected ? root.fg : root.dim)
+
+    foreground: root.fg
+    current: isConnected
+    fill: root.hoverFill
+    currentFill: root.selectedFill
+
+    implicitHeight: protonBody.implicitHeight + (hasDetails ? protonGrid.implicitHeight + Style.spacing.md : 0)
+
+    Item {
+      id: protonBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      implicitHeight: Math.max(protonIcon.implicitHeight, protonInfo.implicitHeight, protonSwitch.implicitHeight) + Style.spacing.rowPaddingX
+
+      Text {
+        id: protonIcon
+        textFormat: Text.PlainText
+        text: "󰒃"
+        color: prow.statusColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      ToggleSwitch {
+        id: protonSwitch
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        checked: prow.isConnected
+        busy: prow.isBusy
+        foreground: root.fg
+        accent: Color.accent
+        onToggled: root.toggleProton()
+
+        PanelToolTip {
+          visible: protonSwitch.containsMouse
+          text: prow.isConnected ? "Disconnect Proton VPN" : "Connect Proton VPN"
+          fontFamily: root.fontFamily
+        }
+      }
+
+      Column {
+        id: protonInfo
+        spacing: Style.space(1)
+        anchors.left: protonIcon.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: protonSwitch.left
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Proton VPN"
+          color: root.fg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+          width: parent.width
+        }
+        Text {
+          textFormat: Text.PlainText
+          text: prow.statusText
+          color: prow.statusColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          width: parent.width
+        }
+      }
+    }
+
+    GridLayout {
+      id: protonGrid
+      visible: prow.hasDetails
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: protonBody.bottom
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      anchors.topMargin: Style.space(4)
+      columns: 4
+      columnSpacing: Style.space(20)
+      rowSpacing: Style.spacing.labelGap
+
+      Text { textFormat: Text.PlainText; text: "Server"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: root.proton.server || "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; elide: Text.ElideRight }
+      Text { textFormat: Text.PlainText; text: "Load"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: root.proton.load || "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+
+      Text { textFormat: Text.PlainText; text: "Protocol"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: root.proton.protocol || "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { textFormat: Text.PlainText; text: "IP Address"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: prow.stats ? (Model.formatVpnIp(prow.stats.ip) || "--") : "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+
+      Text { textFormat: Text.PlainText; text: "Receiving"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: prow.stats ? Model.formatRate(prow.stats.downloadRate) : "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { textFormat: Text.PlainText; text: "Sending"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: prow.stats ? Model.formatRate(prow.stats.uploadRate) : "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+
+      Text { textFormat: Text.PlainText; text: "Downloaded"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: prow.stats ? Model.formatBytes(prow.stats.rx) : "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { textFormat: Text.PlainText; text: "Uploaded"; color: root.fg; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+      Text { Layout.fillWidth: true; textFormat: Text.PlainText; horizontalAlignment: Text.AlignRight; text: prow.stats ? Model.formatBytes(prow.stats.tx) : "--"; color: root.fg; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+    }
+  }
+}
